@@ -685,10 +685,15 @@ const stubFb = (() => {
   return fb;
 })();
 function stubSync() {
+  // 保存/恢复现场：探针切换绘制目标后必须还原，否则后续帧会画进桩缓冲（黑屏）
+  const prevFb = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+  const vp = gl.getParameter(gl.VIEWPORT);
   gl.bindFramebuffer(gl.FRAMEBUFFER, stubFb);
   gl.viewport(0, 0, 1, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, stubPx);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+  gl.viewport(vp[0], vp[1], vp[2], vp[3]);
 }
 let rbFloor = 0.4;
 (function calibrateRB() {          // 启动时队列空闲：三次取最小值 = 纯回读开销
