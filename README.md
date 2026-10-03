@@ -2,6 +2,8 @@
 
 [极光海洋原版](https://github.com/WangXP7/YiQiVibe-WBGL2-GLSL-ocean-ZG5.3F)的性能优化研究项目：同一个场景，4 个优化档位集成在一个页面里，面板按钮即时切换（默认版本一，选择持久化到 localStorage）。
 
+📖 技术原理详解（渲染管线、FBM、光线步进、性能模型）：[原仓库文档](https://github.com/WangXP7/YiQiVibe-WBGL2-GLSL-ocean-ZG5.3F/blob/main/WebGL2-%E5%8E%9F%E7%94%9FGLSL%E6%8A%80%E6%9C%AF%E8%AF%A6%E8%A7%A3.md)
+
 **在线体验**：<https://wangxp7.github.io/YiQiVibe-WBGL2-GLSL-ocean-ZG5.3F-perf/>
 
 ## 版本说明
