@@ -25,7 +25,7 @@
   }
   #vrow { display: flex; gap: 6px; flex-wrap: wrap; }
   .vbtn {
-    flex: 1; padding: 6px 4px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+    padding: 5px 12px; border-radius: 8px; cursor: pointer; white-space: nowrap;
     border: 1px solid rgba(120,255,190,.25); background: rgba(20,40,36,.5); color: #9fc4b4;
     font: 12px system-ui, "Microsoft YaHei", sans-serif;
   }
@@ -453,7 +453,7 @@ function ensureNoiseTex() {
 }
 
 /* ============================ 状态与面板 ============================ */
-const P = { scale: 0.60, aurora: 1.70, wave: 1.60, speed: 1.00, yaw: 0, pitch: -0.12, gpuCap: 80, gpuMs: 0, gpuLoad: 0, frameN: 0, gpuTimerOK: false, gpuTimerBroken: false };
+const P = { scale: 0.60, aurora: 1.70, wave: 1.60, speed: 1.00, yaw: 0, pitch: -0.12, gpuCap: 80, gpuMs: 0, gpuLoad: 0, frameN: 0, rbOK: false };
 const stepsTiers = [28, 22, 16, 12];
 let stepsIdx = 0;
 let VER = parseInt(localStorage.getItem('aoPerfVer') || '1', 10);
@@ -636,7 +636,7 @@ function render(now, dtOverride) {
   }
   P.frameN++;
 
-  // GPU 占用估算（与原版同策略；基准测试模式下跳过）
+  // GPU 占用估算（基准测试模式下跳过）：桩回读为主方案，帧间隔仅在 GPU 瓶颈时作兜底
   if (dtOverride === undefined) {
     const frameMs = Math.min(now - prevNow, 60);
     prevNow = now;
@@ -645,49 +645,61 @@ function render(now, dtOverride) {
       fpsEl.textContent = fps.toFixed(0) + ' FPS · GPU≈' + Math.round(P.gpuLoad) + '% · 步数' + stepsTiers[stepsIdx] + ' · ' + Math.round(P.scale * 100) + '% (' + canvas.width + '×' + canvas.height + ')';
       $('gpuVal').textContent = Math.round(P.gpuLoad) + '% / ' + P.gpuCap + '%';
     }
-    let q = null;
-    if (gpuTimerExt && !P.gpuTimerBroken) {
-      try {
-        q = gpuTimerExt.createQuery();
-        gpuTimerExt.beginQuery(gpuTimerExt.TIME_ELAPSED_EXT, q);
-      } catch (e) { P.gpuTimerBroken = true; q = null; }
+    // 每 15 帧探针一次（高负载时降频到每 30 帧，减少同步停顿）
+    if (P.frameN % (P.gpuLoad > 70 ? 30 : 15) === 7) {
+      const t0 = performance.now();
+      stubSync();
+      const sample = performance.now() - t0;
+      if (sample < rbFloor) rbFloor = sample;            // 回读开销只降不升
+      P.gpuMs += (Math.max(0, sample - rbFloor) - P.gpuMs) * 0.25;
+      P.rbOK = true;
     }
-    if (q) {
-      try { gpuTimerExt.endQuery(gpuTimerExt.TIME_ELAPSED_EXT); pendingQ.push(q); }
-      catch (e) { P.gpuTimerBroken = true; }
-      gpuPoll();
+    if (P.rbOK) {
+      P.gpuLoad = Math.min(100, P.gpuMs / 16.667 * 100);
+    } else if (frameMs >= 18 || fps < 57) {
+      // 兜底：帧间隔超过 18ms 说明 GPU 是瓶颈，间隔≈GPU 耗时；满帧率时保持上次读数
+      P.gpuMs += (frameMs - P.gpuMs) * 0.08;
+      P.gpuLoad = Math.min(100, P.gpuMs / 16.667 * 100);
     }
-    if (!P.gpuTimerOK) {
-      if (frameMs >= 18 || fps < 57) P.gpuMs += (frameMs - P.gpuMs) * 0.08;
-      else P.gpuMs += (9.2 - P.gpuMs) * 0.02;
-    }
-    P.gpuLoad = Math.min(100, P.gpuMs / 16.667 * 100);
   }
 }
 
-/* ============================ GPU 占用估算（同原版策略） ============================ */
-const gpuTimerExt = (() => { try { return gl.getExtension('EXT_disjoint_timer_query_webgl2'); } catch (e) { return null; } })();
-const pendingQ = [];
-function gpuPoll() {
-  if (!gpuTimerExt) return;
-  let disjoint = false;
-  try { disjoint = gpuTimerExt.getParameter(gpuTimerExt.GPU_DISJOINT_EXT); } catch (e) { return; }
-  while (pendingQ.length) {
-    const q = pendingQ[0];
-    let avail = false;
-    try { avail = gpuTimerExt.getQueryParameter(q, gpuTimerExt.QUERY_RESULT_AVAILABLE); } catch (e) { break; }
-    if (!avail) break;
-    pendingQ.shift();
-    if (!disjoint) {
-      const ns = gpuTimerExt.getQueryParameter(q, gpuTimerExt.QUERY_RESULT);
-      if (ns > 5e3 && ns < 5e7) {
-        P.gpuMs += (ns / 1e6 - P.gpuMs) * 0.25;
-        P.gpuTimerOK = true;
-      }
-    }
-    gpuTimerExt.deleteQuery(q);
-  }
+/* ============================ GPU 占用估算：桩回读 ============================
+ * 原理：GPU 队列按序执行——帧末往 1×1 RGBA8 桩 FBO 提交 clear 再 readPixels，
+ * 驱动必须等本帧全部绘制真正执行完才能返回数据，耗时≈真实单帧 GPU 时间。
+ * （本机 ANGLE/D3D11 上 gl.finish() 不同步、定时器查询不可用、16F 回读会崩，
+ * 桩回读是经实验验证唯一可靠的同步手段；rbFloor 为启动时空队列标定的固定回读开销） */
+const stubPx = new Uint8Array(4);
+const stubFb = (() => {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.clearColor(0, 0, 0, 1);
+  return fb;
+})();
+function stubSync() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, stubFb);
+  gl.viewport(0, 0, 1, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, stubPx);
 }
+let rbFloor = 0.4;
+(function calibrateRB() {          // 启动时队列空闲：三次取最小值 = 纯回读开销
+  let m = 1e9;
+  for (let i = 0; i < 4; i++) {
+    const t0 = performance.now();
+    stubSync();
+    m = Math.min(m, performance.now() - t0);
+  }
+  rbFloor = m;
+})();
 
 /* ============================ 主循环 ============================ */
 let simT = 0, last = performance.now(), fps = 60, lastUi = 0, lastFrame = 0, prevNow = performance.now();
@@ -717,11 +729,7 @@ setInterval(() => {
 }, 600);
 
 /* ============================ 基准测试钩子 ============================ */
-function syncGPU() {
-  try { gl.finish(); } catch (e) {}
-  const px = new Uint8Array(4);
-  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
-}
+function syncGPU() { stubSync(); }   // 桩回读强制排空 GPU 队列（finish 在部分驱动上不同步）
 window.__gpuBench = function (frames) {
   frames = Math.max(10, frames | 0 || 120);
   for (let i = 0; i < 8; i++) render(performance.now(), 1 / 60);   // 预热
